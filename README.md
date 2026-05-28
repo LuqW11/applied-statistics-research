@@ -63,6 +63,24 @@ independent of household income quintile. Attending university at 17 adds
 
 ---
 
+### Socio-economic predictors of problem gambling
+Logistic regression analysis of Health Survey data covering ~13,000 adults
+in England and Scotland. Forward selection over socio-economic, demographic,
+and lifestyle predictors, with average predictive comparisons (APCs) on the
+probability scale to quantify effect sizes.
+
+**Headline finding.** Higher income and active employment predict higher
+problem-gambling risk. Lower qualifications, retirement, and Muslim religious
+affiliation predict lower risk. Scottish residents have lower risk than
+English residents, but the effect appears to be explained by demographic
+composition rather than geography. Class imbalance limits the model's
+discriminative ability (1% specificity), an honest limitation rather than
+a hidden flaw.
+
+`R` · `arm` · `car` · Health Survey for England/Scotland · logistic regression
+
+→ [`problem-gambling-predictors/`](./problem-gambling-predictors)
+
 ## Methods used across projects
 
 Multilevel models (random intercepts, random slopes, cross-level
