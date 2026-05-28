@@ -45,7 +45,7 @@ attitudes drifting slightly less liberal with age.
 
 ---
 
-### Pre-16 and post-16 determinants of income at 25
+### Determinants of income at 25
 Linear model of weekly earnings at age 25 using LSYPE data on ~16,000
 individuals in England, born 1989–90. Separately examines factors
 collected during mandatory school years (Wave 1–4) and post-16 transitions
