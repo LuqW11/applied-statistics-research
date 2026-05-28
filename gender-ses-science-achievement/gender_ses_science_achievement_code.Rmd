@@ -1,0 +1,678 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+
+## Setup and load libraries
+
+```{r libraries}
+library(haven)
+library(rstanarm)
+library(performance)
+library(lme4)
+library(glmnet)
+library(moments)
+library(tidyverse)
+```
+
+## Loading data
+
+```{r}
+load("/T23/bsaengm8.rdata")   # → BSAENGM8
+load("/T23/bsgengm8.rdata")   # → BSGENGM8
+load("/T23/bcgengm8.rdata")   # → BCGENGM8
+```
+
+```{r}
+# Strip SPSS labels
+BSAENGM8 <- zap_labels(BSAENGM8)
+BSGENGM8 <- zap_labels(BSGENGM8)
+BCGENGM8 <- zap_labels(BCGENGM8)
+```
+
+---
+
+## Data Cleaning & Variable Construction
+
+### Helper Function
+
+```{r}
+# Recode 9/99/999 to NA
+clean_val <- function(x, missing = c(9, 99, 999, 9999)) {
+  x <- as.numeric(x)
+  x[x %in% missing] <- NA
+  x
+}
+```
+
+### We average over the 5 Science Score values 
+
+```{r}
+# Average across 5 plausible values
+BSAENGM8 <- BSAENGM8 %>%
+  mutate(PV1SCIE = rowMeans(select(., BSSSCI01:BSSSCI05), na.rm = TRUE))
+```
+
+### encoding: Student-Level Variables
+
+```{r}
+BSGENGM8 <- BSGENGM8 %>%
+  mutate(
+    GENDER = factor(clean_val(ITSEX, 9),
+                    levels = c(1, 2),
+                    labels = c("Girl", "Boy")),
+    ESCS = factor(clean_val(BSDGHER, 9),
+                  levels = c(1, 2, 3), ordered = TRUE,
+                  labels = c("Many Resources", "Some Resources", "Few Resources")),
+    BOOKS_HOME = factor(clean_val(BSBG04, 9),
+                        levels = 1:5, ordered = TRUE,
+                        labels = c("0-10", "11-25", "26-100", "101-200", "200+")),
+    Internet_or_room = factor(clean_val(BSDG05S, 9),
+                              levels = c(1, 2, 3), ordered = TRUE,
+                              labels = c("None", "Either", "Both")),
+    PAR_EDU = factor(clean_val(BSDGEDUP, c(6, 9)),
+                     levels = 1:5, ordered = TRUE,
+                     labels = c("University+", "Post-secondary", "Upper secondary",
+                                "Lower secondary", "Some primary")),
+    BELONGING = factor(clean_val(BSDGSSB, 9),
+                       levels = c(1, 2, 3), ordered = TRUE,
+                       labels = c("High", "Some", "Little"))
+  )
+```
+
+### School-Level Variables
+
+```{r}
+BCGENGM8 <- BCGENGM8 %>%
+  mutate(
+    SCH_DISADV = factor(clean_val(BCBG03A, 9),
+                        levels = 1:4, ordered = TRUE,
+                        labels = c("0-10%", "11-25%", "26-50%", "50%+")),
+    SCH_SES = factor(clean_val(BCDGSBC, 9),
+                     levels = c(1, 2, 3),
+                     labels = c("More Affluent", "Mixed", "More Disadvantaged")),
+    ACAD_EMPHASIS = factor(clean_val(BCDGEAS, 9),
+                           levels = c(1, 2, 3), ordered = TRUE,
+                           labels = c("Very High", "High", "Medium"))
+  )
+```
+
+
+## 4. Merging & Final Dataset
+
+```{r}
+df <- BSAENGM8 %>%
+  select(IDSCHOOL, IDSTUD, PV1SCIE) %>%
+  left_join(
+    BSGENGM8 %>% select(IDSCHOOL, IDSTUD, GENDER, ESCS, BOOKS_HOME,
+                        Internet_or_room, PAR_EDU, BELONGING),
+    by = c("IDSCHOOL", "IDSTUD")
+  ) %>%
+  left_join(
+    BCGENGM8 %>% select(IDSCHOOL, SCH_SES, SCH_DISADV, ACAD_EMPHASIS),
+    by = "IDSCHOOL"
+  )
+```
+
+
+```{r}
+# Drop students in schools with no school questionnaire response
+df_clean <- df %>%
+  filter(!is.na(SCH_SES)) %>%
+  droplevels()
+```
+
+
+### Missingness Check
+
+```{r}
+df_clean %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(pct = round(n_missing / nrow(df_clean) * 100, 1)) %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+```
+Missigness to high for PAR_EDU - this variable will not be used as a predictor. 
+
+
+```{r}
+# Number of students
+nrow(df_clean)
+
+# Number of schools
+length(unique(df_clean$IDSCHOOL))
+```
+
+
+```{r}
+head(df_clean)
+```
+
+```{r}
+summary(df_clean)
+```
+Proceed with our cleaned dataset 
+
+
+## 5. Exploratory Data Analysis
+### Visualisations
+
+```{r}
+# Summary statistics to support Gaussian assumption
+cat("Mean:", round(mean(df_clean$PV1SCIE), 1), "\n")
+cat("Median:", round(median(df_clean$PV1SCIE), 1), "\n")
+cat("Skewness:", round(moments::skewness(df_clean$PV1SCIE), 3), "\n")
+
+# Histogram with normal curve overlay
+ggplot(df_clean, aes(x = PV1SCIE)) +
+  geom_histogram(aes(y = after_stat(density)), 
+                 bins = 30, fill = "#378ADD", alpha = 0.7) +
+  stat_function(fun = dnorm, 
+                args = list(mean = mean(df_clean$PV1SCIE), 
+                            sd = sd(df_clean$PV1SCIE)),
+                colour = "#D85A30", linewidth = 1) +
+  labs(title = "Distribution of science scores with normal curve",
+       x = "Science Score", y = "Density") +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+table(df_clean$GENDER)
+prop.table(table(df_clean$GENDER))
+```
+
+```{r}
+p2 <- ggplot(df_clean, aes(x = GENDER, y = PV1SCIE, fill = GENDER)) +
+  geom_boxplot(outlier.size = 0.8, outlier.alpha = 0.4, width = 0.5) +
+  scale_fill_manual(values = c("Girl" = "#378ADD", "Boy" = "#1D9E75")) +
+  labs(
+    title = "Science Score by Gender",
+    x     = NULL,
+    y     = "Science Score"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+p2
+```
+
+```{r}
+df_clean %>%
+  group_by(GENDER) %>%
+  summarise(
+    median_score = round(median(PV1SCIE, na.rm = TRUE), 1),
+    Q1 = round(quantile(PV1SCIE, 0.25, na.rm = TRUE), 1),
+    Q3 = round(quantile(PV1SCIE, 0.75, na.rm = TRUE), 1)
+  )
+```
+
+```{r}
+df_clean %>%
+  summarise(
+    mean_score = round(mean(PV1SCIE, na.rm = TRUE), 1)
+  )
+```
+
+
+```{r}
+p5 <- ggplot(df_clean %>% filter(!is.na(ESCS)),
+             aes(x = ESCS, y = PV1SCIE, fill = GENDER)) +
+  geom_boxplot(outlier.size = 0.8, outlier.alpha = 0.4, width = 0.6,
+               position = position_dodge(0.75)) +
+  scale_fill_manual(values = c("Girl" = "#378ADD", "Boy" = "#1D9E75")) +
+  scale_x_discrete(limits = c("Many Resources", "Some Resources", "Few Resources")) +
+  labs(
+    title = "Science Score by Gender and Home Resources",
+    x     = "Home Educational Resources",
+    y     = "Science Score",
+    fill  = "Gender"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+p5
+```
+#more plots but weren't used in the report 
+
+```{r}
+
+# Plot 1: Books at home
+p1 <- ggplot(df_clean %>% filter(!is.na(BOOKS_HOME), !is.na(GENDER)),
+             aes(x = BOOKS_HOME, fill = GENDER)) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("Girl" = "#378ADD", "Boy" = "#1D9E75")) +
+  labs(title = "Books at home", x = NULL, y = "Count", fill = "Gender") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "none")
+
+
+# Plot 3: Parental education
+p3 <- ggplot(df_clean %>% filter(!is.na(PAR_EDU), !is.na(GENDER)),
+             aes(x = PAR_EDU, fill = GENDER)) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("Girl" = "#378ADD", "Boy" = "#1D9E75")) +
+  labs(title = "Parental education", x = NULL, y = "Count", fill = "Gender") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "none")
+
+# Plot 4: School disadvantage
+p4 <- ggplot(df_clean %>% filter(!is.na(SCH_DISADV), !is.na(GENDER)),
+             aes(x = SCH_DISADV, fill = GENDER)) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("Girl" = "#378ADD", "Boy" = "#1D9E75")) +
+  labs(title = "School % disadvantaged", x = NULL, y = "Count", fill = "Gender") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+p1
+p4
+p3
+
+```
+
+
+
+```{r}
+# Quick plot
+ggplot(df_clean %>% filter(!is.na(BELONGING), !is.na(GENDER)),
+       aes(x = BELONGING, fill = GENDER)) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("Girl" = "#378ADD", "Boy" = "#1D9E75")) +
+  labs(title = "Sense of school belonging by gender",
+       x = "Belonging", y = "Count", fill = "Gender") +
+  theme_minimal(base_size = 11)
+```
+```{r}
+df_clean %>%
+  filter(!is.na(BELONGING)) %>%
+  group_by(GENDER) %>%
+  summarise(
+    pct_little = round(mean(BELONGING == "Little") * 100, 1),
+    pct_some   = round(mean(BELONGING == "Some") * 100, 1),
+    pct_high   = round(mean(BELONGING == "High") * 100, 1),
+    n = n()
+  )
+```
+
+
+## 6. Modelling
+
+### 6.1 Prepare Numeric Variables
+
+```{r}
+df_model <- df_clean %>%
+  mutate(
+    # GENDER: Girl = 0, Boy = 1
+    GENDER_num     = as.integer(GENDER == "Boy"),
+
+    # ESCS: reverse so higher = more resources
+    ESCS_num       = 4L - as.integer(ESCS),
+
+    # BOOKS_HOME: already low to high
+    BOOKS_num      = as.integer(BOOKS_HOME),
+
+    # Internet_or_room: already low to high
+    INTERNET_num   = as.integer(Internet_or_room),
+
+    # PAR_EDU: reverse so higher = more education
+    PAR_EDU_num    = ifelse(PAR_EDU == "Not applicable", NA_real_,
+                            6L - as.integer(PAR_EDU) + 1L),
+
+    # BELONGING: reverse so higher = more belonging
+    BELONGING_num  = 4L - as.integer(BELONGING),
+
+    # SCH_DISADV: already low to high
+    SCH_DISADV_num = as.integer(SCH_DISADV),
+
+    # ACAD_EMPHASIS: reverse so higher = more emphasis
+    ACAD_num       = 4L - as.integer(ACAD_EMPHASIS),
+
+    # SCH_SES: dummy coded, reference = More Affluent
+    SCH_SES_mixed  = as.integer(SCH_SES == "Mixed"),
+    SCH_SES_disadv = as.integer(SCH_SES == "More Disadvantaged")
+  )
+```
+
+### 6.2 Missing-Indicator Imputation
+
+```{r}
+df_model <- df_model %>%
+  mutate(
+    BELONGING_missing = as.integer(is.na(BELONGING_num)),
+    INTERNET_missing  = as.integer(is.na(INTERNET_num)),
+    ESCS_missing      = as.integer(is.na(ESCS_num)),
+    BOOKS_missing     = as.integer(is.na(BOOKS_num)),
+
+    # Replace NAs with 0 so rows are retained
+    BELONGING_num = replace_na(BELONGING_num, 0),
+    INTERNET_num  = replace_na(INTERNET_num, 0),
+    ESCS_num      = replace_na(ESCS_num, 0),
+    BOOKS_num     = replace_na(BOOKS_num, 0)
+  )
+```
+
+Standardise the PV1SCIE to obtain simpler parameters for the prior 
+```{r}
+df_model <- df_model %>%
+  mutate(PV1SCIE_std = as.numeric(scale(PV1SCIE)))
+```
+
+
+### 6.4 Frequentist Models
+
+#### Model 1 — Full (with all missing flags)
+
+```{r}
+model_freq_1 <- lm(
+  PV1SCIE_std ~ GENDER_num + ESCS_num + BOOKS_num + INTERNET_num +
+    BELONGING_num + SCH_DISADV_num + ACAD_num +
+    SCH_SES_mixed + SCH_SES_disadv +
+    BELONGING_missing + INTERNET_missing +
+    ESCS_missing + BOOKS_missing,
+  data = df_model
+)
+
+summary(model_freq_1)
+```
+
+#### Model 2 — Final (backward selection; non-significant terms dropped)
+
+```{r}
+model_freq_final <- lm(
+  PV1SCIE_std ~ GENDER_num + ESCS_num + BOOKS_num + BELONGING_num +
+    SCH_DISADV_num + ACAD_num + SCH_SES_mixed +
+    BELONGING_missing + BOOKS_missing,
+  data = df_model
+)
+
+summary(model_freq_final)
+```
+
+```{r}
+icc_manual <- function(grouping_var) {
+  formula <- as.formula(paste("PV1SCIE_std ~ 1 + (1 |", grouping_var, ")"))
+  m <- lmer(formula, data = df_model)
+  vc <- as.data.frame(VarCorr(m))
+  between <- vc$vcov[1]
+  total   <- sum(vc$vcov)
+  cat(grouping_var, "ICC =", round(between / total, 4), "\n")
+}
+
+icc_manual("SCH_DISADV")
+icc_manual("SCH_SES")
+icc_manual("ACAD_EMPHASIS")
+```
+
+### 6.5 Bayesian Model
+
+```{r}
+multilevel_intercept <- stan_lmer(
+  PV1SCIE_std ~ GENDER_num + ESCS_num + BOOKS_num + BELONGING_num +
+                SCH_DISADV_num + ACAD_num +
+                BELONGING_missing + BOOKS_missing +
+                (1 | SCH_DISADV),
+  data            = df_model,
+  prior           = normal(location = 0, scale = 2.5),
+  prior_intercept = normal(location = 0, scale = 5),
+  chains          = 4,
+  iter            = 2000,
+  seed            = 1234,
+  refresh         = 0
+)
+
+summary(multilevel_intercept)
+posterior_interval(multilevel_intercept, prob = 0.95)
+summary(bayes_R2(multilevel_intercept))
+```
+
+
+
+#testing interactions 
+
+```{r}
+
+# BOOKS x SCH_SES
+m2_books_ses <- lm(PV1SCIE_std ~ BOOKS_num * SCH_SES + GENDER_num + 
+                   ESCS_num + BELONGING_num + SCH_DISADV_num + ACAD_num +
+                   BELONGING_missing + BOOKS_missing,
+                   data = df_model)
+anova(model_freq_final , m2_books_ses)
+
+# ESCS x SCH_SES
+m2_escs_ses <- lm(PV1SCIE_std ~ ESCS_num * SCH_SES + GENDER_num + 
+                  BOOKS_num + BELONGING_num + SCH_DISADV_num + ACAD_num +
+                  BELONGING_missing + BOOKS_missing,
+                  data = df_model)
+anova(model_freq_final, m2_escs_ses)
+
+# GENDER x SCH_SES
+m2_gender_ses <- lm(PV1SCIE_std ~ GENDER_num * SCH_SES + ESCS_num + 
+                    BOOKS_num + BELONGING_num + SCH_DISADV_num + ACAD_num +
+                    BELONGING_missing + BOOKS_missing,
+                    data = df_model)
+anova(model_freq_final , m2_gender_ses)
+
+# BELONGING x SCH_SES
+m2_belonging_ses <- lm(PV1SCIE_std ~ BELONGING_num * SCH_SES + GENDER_num + 
+                       ESCS_num + BOOKS_num + SCH_DISADV_num + ACAD_num +
+                       BELONGING_missing + BOOKS_missing,
+                       data = df_model)
+anova(model_freq_final, m2_belonging_ses)
+
+
+# BOOKS x SCH_DISADV
+m2_books_disadv <- lm(PV1SCIE_std ~ BOOKS_num * SCH_DISADV + GENDER_num + 
+                      ESCS_num + BELONGING_num + ACAD_num + SCH_SES_mixed +
+                      SCH_SES_disadv + BELONGING_missing + BOOKS_missing,
+                      data = df_model)
+anova(model_freq_final, m2_books_disadv)
+
+# BOOKS x ACAD_EMPHASIS
+m2_books_acad <- lm(PV1SCIE_std ~ BOOKS_num * ACAD_EMPHASIS + GENDER_num + 
+                    ESCS_num + BELONGING_num + SCH_DISADV_num + SCH_SES_mixed +
+                    SCH_SES_disadv + BELONGING_missing + BOOKS_missing,
+                    data = df_model)
+anova(model_freq_final, m2_books_acad)
+
+# ESCS x SCH_DISADV
+m2_escs_disadv <- lm(PV1SCIE_std ~ ESCS_num * SCH_DISADV + GENDER_num + 
+                     BOOKS_num + BELONGING_num + ACAD_num + SCH_SES_mixed +
+                     SCH_SES_disadv + BELONGING_missing + BOOKS_missing,
+                     data = df_model)
+anova(model_freq_final, m2_escs_disadv)
+
+# ESCS x ACAD_EMPHASIS
+m2_escs_acad <- lm(PV1SCIE_std ~ ESCS_num * ACAD_EMPHASIS + GENDER_num + 
+                   BOOKS_num + BELONGING_num + SCH_DISADV_num + SCH_SES_mixed +
+                   SCH_SES_disadv + BELONGING_missing + BOOKS_missing,
+                   data = df_model)
+anova(model_freq_final, m2_escs_acad)
+
+# GENDER x SCH_DISADV
+m2_gender_disadv <- lm(PV1SCIE_std ~ GENDER_num * SCH_DISADV + ESCS_num + 
+                       BOOKS_num + BELONGING_num + ACAD_num + SCH_SES_mixed +
+                       SCH_SES_disadv + BELONGING_missing + BOOKS_missing,
+                       data = df_model)
+anova(model_freq_final, m2_gender_disadv)
+
+# GENDER x ACAD_EMPHASIS
+m2_gender_acad <- lm(PV1SCIE_std ~ GENDER_num * ACAD_EMPHASIS + ESCS_num + 
+                     BOOKS_num + BELONGING_num + SCH_DISADV_num + SCH_SES_mixed +
+                     SCH_SES_disadv + BELONGING_missing + BOOKS_missing,
+                     data = df_model)
+anova(model_freq_final, m2_gender_acad)
+
+# BELONGING x SCH_DISADV
+m2_belonging_disadv <- lm(PV1SCIE_std ~ BELONGING_num * SCH_DISADV + GENDER_num + 
+                          ESCS_num + BOOKS_num + ACAD_num + SCH_SES_mixed +
+                          SCH_SES_disadv + BELONGING_missing + BOOKS_missing,
+                          data = df_model)
+anova(model_freq_final, m2_belonging_disadv)
+
+# BELONGING x ACAD_EMPHASIS
+m2_belonging_acad <- lm(PV1SCIE_std ~ BELONGING_num * ACAD_EMPHASIS + GENDER_num + 
+                        ESCS_num + BOOKS_num + SCH_DISADV_num + SCH_SES_mixed +
+                        SCH_SES_disadv + BELONGING_missing + BOOKS_missing,
+                        data = df_model)
+anova(model_freq_final, m2_belonging_acad)
+
+```
+
+
+we use female & SCH_DISADV
+## random slopes
+
+```{r}
+multilevel_slopes_v2 <- stan_lmer(
+  PV1SCIE_std ~ GENDER_num + ESCS_num + BOOKS_num + BELONGING_num +
+                SCH_DISADV_num + ACAD_num +
+                BELONGING_missing + BOOKS_missing +
+                (1 + GENDER_num | SCH_DISADV),
+  data            = df_model,
+  prior           = normal(location = 0, scale = 2.5),
+  prior_intercept = normal(location = 0, scale = 5),
+  chains          = 4,
+  iter            = 2000,
+  seed            = 1234,
+  refresh         = 0
+)
+```
+
+
+```{r}
+summary(multilevel_slopes_v2)
+posterior_interval(multilevel_slopes_v2, prob = 0.95)
+summary(bayes_R2(multilevel_slopes_v2))
+```
+
+
+
+```{r}
+set.seed(1234)
+n          <- nrow(df_model)
+train_idx  <- sample(1:n, size = 0.8 * n)
+train_data <- df_model[train_idx, ]
+test_data  <- df_model[-train_idx, ]
+
+vars_used <- c("GENDER_num", "ESCS_num", "BOOKS_num", "BELONGING_num",
+               "SCH_DISADV_num", "ACAD_num",
+               "BELONGING_missing", "BOOKS_missing")
+
+test_eval  <- test_data  %>% drop_na(all_of(c("PV1SCIE_std", vars_used)))
+train_eval <- train_data %>% drop_na(all_of(c("PV1SCIE_std", vars_used)))
+
+# Frequentist
+freq_train <- lm(
+  PV1SCIE_std ~ GENDER_num + ESCS_num + BOOKS_num + BELONGING_num +
+                SCH_DISADV_num + ACAD_num +
+                BELONGING_missing + BOOKS_missing,
+  data = train_eval
+)
+
+# Bayesian
+bayes_train <- stan_glm(
+  PV1SCIE_std ~ GENDER_num + ESCS_num + BOOKS_num + BELONGING_num +
+                SCH_DISADV_num + ACAD_num +
+                BELONGING_missing + BOOKS_missing,
+  data = train_eval,
+  prior = normal(0, 2.5),
+  prior_intercept = normal(0, 5),
+  chains = 4, iter = 2000, seed = 1234, refresh = 0
+)
+
+# Multilevel intercept
+multi_intercept_train <- stan_lmer(
+  PV1SCIE_std ~ GENDER_num + ESCS_num + BOOKS_num + BELONGING_num +
+                SCH_DISADV_num + ACAD_num +
+                BELONGING_missing + BOOKS_missing +
+                (1 | SCH_DISADV),
+  data = train_eval,
+  prior = normal(0, 2.5),
+  prior_intercept = normal(0, 5),
+  chains = 4, iter = 2000, seed = 1234, refresh = 0
+)
+
+# Multilevel slopes
+multi_slopes_train <- stan_lmer(
+  PV1SCIE_std ~ GENDER_num + ESCS_num + BOOKS_num + BELONGING_num +
+                SCH_DISADV_num + ACAD_num +
+                BELONGING_missing + BOOKS_missing +
+                (1 + GENDER_num | SCH_DISADV),
+  data = train_eval,
+  prior = normal(0, 2.5),
+  prior_intercept = normal(0, 5),
+  chains = 4, iter = 2000, seed = 1234, refresh = 0
+)
+
+# Lasso and Ridge
+
+X_train <- model.matrix(PV1SCIE_std ~ .,
+                        data = train_eval[, c("PV1SCIE_std", vars_used)])[, -1]
+y_train <- train_eval$PV1SCIE_std
+X_test  <- model.matrix(PV1SCIE_std ~ .,
+                        data = test_eval[, c("PV1SCIE_std", vars_used)])[, -1]
+y_test  <- test_eval$PV1SCIE_std
+
+lasso_model <- cv.glmnet(X_train, y_train, alpha = 1, nfolds = 10)
+ridge_model <- cv.glmnet(X_train, y_train, alpha = 0, nfolds = 10)
+
+# Predictions
+freq_pred         <- predict(freq_train, newdata = test_eval)
+bayes_pred        <- colMeans(posterior_epred(bayes_train, newdata = test_eval))
+multi_int_pred    <- colMeans(posterior_epred(multi_intercept_train, newdata = test_eval))
+multi_slopes_pred <- colMeans(posterior_epred(multi_slopes_train, newdata = test_eval))
+lasso_pred        <- as.numeric(predict(lasso_model, newx = X_test, s = "lambda.min"))
+ridge_pred        <- as.numeric(predict(ridge_model, newx = X_test, s = "lambda.min"))
+
+# RMSE
+rmse_fn <- function(actual, predicted) sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+
+data.frame(
+  Model = c("Frequentist", "Bayesian", "Multilevel intercept",
+            "Multilevel slopes", "Lasso", "Ridge"),
+  RMSE  = round(c(
+    rmse_fn(y_test, freq_pred),
+    rmse_fn(y_test, bayes_pred),
+    rmse_fn(y_test, multi_int_pred),
+    rmse_fn(y_test, multi_slopes_pred),
+    rmse_fn(y_test, lasso_pred),
+    rmse_fn(y_test, ridge_pred)
+  ), 4)
+)
+
+```
+
+
+
+```{r}
+coef(ridge_model, s = "lambda.min")
+```
+
+#plot for observed vs predicted 
+```{r}
+
+
+# --- Observed vs predicted (multilevel slopes model) ---
+test_eval$predicted <- multi_slopes_pred
+
+obs_pred_plot <- ggplot(test_eval, aes(x = predicted, y = PV1SCIE_std)) +
+  geom_point(alpha = 0.3, size = 0.8, colour = "#378ADD") +
+  geom_abline(slope = 1, intercept = 0,
+              colour = "#D85A30", linewidth = 0.8) +
+  labs(title = "Observed vs predicted science scores",
+       x     = "Predicted (standardised)",
+       y     = "Observed (standardised)") +
+  theme_minimal(base_size = 12)
+
+obs_pred_plot
+
+
+```
+
+```{r}
+coef(lasso_model, s = "lambda.min")
+```
+
+
